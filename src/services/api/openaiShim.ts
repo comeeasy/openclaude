@@ -265,6 +265,19 @@ function makeMessageId(): string {
   return `msg_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
 }
 
+function convertChunkUsage(
+  usage: OpenAIStreamChunk['usage'] | undefined,
+): Partial<AnthropicUsage> | undefined {
+  if (!usage) return undefined
+
+  return {
+    input_tokens: usage.prompt_tokens ?? 0,
+    output_tokens: usage.completion_tokens ?? 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+  }
+}
+
 /**
  * Async generator that transforms an OpenAI SSE stream into
  * Anthropic-format BetaRawMessageStreamEvent objects.
@@ -277,6 +290,8 @@ async function* openaiStreamToAnthropic(
   let contentBlockIndex = 0
   const activeToolCalls = new Map<number, { id: string; name: string; index: number }>()
   let hasEmittedContentStart = false
+  let lastStopReason: 'tool_use' | 'max_tokens' | 'end_turn' | null = null
+  let hasEmittedFinalUsage = false
 
   // Emit message_start
   yield {
@@ -323,6 +338,8 @@ async function* openaiStreamToAnthropic(
       } catch {
         continue
       }
+
+      const chunkUsage = convertChunkUsage(chunk.usage)
 
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta
@@ -425,15 +442,30 @@ async function* openaiStreamToAnthropic(
               : choice.finish_reason === 'length'
                 ? 'max_tokens'
                 : 'end_turn'
+          lastStopReason = stopReason
 
           yield {
             type: 'message_delta',
             delta: { stop_reason: stopReason, stop_sequence: null },
-            usage: {
-              output_tokens: chunk.usage?.completion_tokens ?? 0,
-            },
+            ...(chunkUsage ? { usage: chunkUsage } : {}),
+          }
+          if (chunkUsage) {
+            hasEmittedFinalUsage = true
           }
         }
+      }
+
+      if (
+        !hasEmittedFinalUsage &&
+        chunkUsage &&
+        (chunk.choices?.length ?? 0) === 0
+      ) {
+        yield {
+          type: 'message_delta',
+          delta: { stop_reason: lastStopReason, stop_sequence: null },
+          usage: chunkUsage,
+        }
+        hasEmittedFinalUsage = true
       }
     }
   }
